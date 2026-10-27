@@ -181,12 +181,17 @@ def _contains_inline_key(value: Any) -> bool:
     return False
 
 
+def default_config_dir() -> Path:
+    return (
+        Path(os.environ.get("AIH_CONFIG_DIR", Path(__file__).resolve().parents[2] / "config"))
+        .expanduser()
+        .resolve()
+    )
+
+
 def load_settings(config_dir: Path | None = None) -> AppSettings:
     """Load config.yaml, then apply AIH_* environment overrides."""
-    configured_dir = config_dir or Path(
-        os.environ.get("AIH_CONFIG_DIR", Path(__file__).resolve().parents[2] / "config")
-    )
-    configured_dir = configured_dir.expanduser().resolve()
+    configured_dir = (config_dir or default_config_dir()).expanduser().resolve()
     config_path = configured_dir / "config.yaml"
     raw: dict[str, Any] = {}
 

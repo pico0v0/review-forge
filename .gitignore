@@ -12,6 +12,7 @@ frontend/dist/
 data/
 config/config.yaml
 config/projects.yaml
+config/*.lock
 .env
 .env.*
 !.env.example

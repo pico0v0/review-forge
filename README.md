@@ -10,7 +10,9 @@ Only changes that pass the quality gate can be applied to the original project.
 
 The backend foundation is runnable: validated YAML/environment configuration,
 SQLite migrations, a single-instance lock, local session authentication, and a
-database health endpoint. Review automation and the console are being implemented.
+database health endpoint. Authenticated endpoints manage Git project registrations
+and perform bounded OpenAI-compatible model connection checks. Review automation
+and the console are being implemented.
 See
 [the development specification](docs/开发文档.md) for the planned architecture,
 protocols, quality gates, and milestones. The V1 document is retained as history.
