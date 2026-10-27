@@ -1,0 +1,26 @@
+# Copy to config.yaml. That file is ignored by Git.
+server:
+  host: 127.0.0.1
+  port: 8787
+paths:
+  data_dir: ~/.reviewforge/data
+security:
+  code_egress_acknowledged: false
+  allow_http_localhost: true
+models:
+  providers:
+    - id: relay
+      type: openai_compatible
+      base_url: https://api.openai.com/v1
+      api_key_env: REVIEWFORGE_API_KEY
+      timeout_sec: 600
+      max_retries: 3
+      models:
+        - id: your-model-id
+          context_window: 128000
+          max_output_tokens: 16000
+          input_usd_per_1m: 0
+          output_usd_per_1m: 0
+  roles:
+    reviewer: {provider: relay, model: your-model-id}
+    fixer: {provider: relay, model: your-model-id}
