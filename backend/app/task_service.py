@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -26,13 +27,28 @@ from app.validation import run_check
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_STATES = {"CREATED", "BUILDING_CONTEXT", "REVIEWING", "FIXING", "VALIDATING"}
+ACTIVE_STATES = {
+    "CREATED",
+    "BUILDING_CONTEXT",
+    "REVIEWING",
+    "FIXING",
+    "VALIDATING",
+    "FINALIZING",
+}
 TRANSITIONS = {
     "CREATED": {"BUILDING_CONTEXT", "NEEDS_ATTENTION", "CANCELLED"},
     "BUILDING_CONTEXT": {"REVIEWING", "NEEDS_ATTENTION", "CANCELLED"},
     "REVIEWING": {"VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
     "FIXING": {"REVIEWING", "VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
-    "VALIDATING": {"FIXING", "REVIEWING", "COMPLETED", "NEEDS_ATTENTION", "CANCELLED"},
+    "VALIDATING": {
+        "FIXING",
+        "REVIEWING",
+        "FINALIZING",
+        "COMPLETED",
+        "NEEDS_ATTENTION",
+        "CANCELLED",
+    },
+    "FINALIZING": {"COMPLETED", "NEEDS_ATTENTION", "CANCELLED"},
 }
 TASK_ID_PATTERN = re.compile(r"^REV-\d{8}-\d{3,}$")
 
@@ -90,13 +106,6 @@ class TaskService:
         self.projects = projects
 
     def create(self, request: ReviewSubmitRequest) -> ReviewTask:
-        if not request.dry_run:
-            raise HubError(
-                "feature_not_available",
-                "This milestone supports read-only dry_run reviews; "
-                "automatic repair is forthcoming",
-                422,
-            )
         if not self.settings.security.code_egress_acknowledged:
             raise HubError(
                 "code_egress_unacknowledged",
@@ -192,7 +201,8 @@ class TaskService:
                         "limits": effective_limits,
                         "reviewer": reviewer.model_dump(mode="json"),
                         "fixer": fixer.model_dump(mode="json") if fixer else None,
-                        "dry_run": True,
+                        "dry_run": request.dry_run,
+                        "finalize_mode": "dry_run" if request.dry_run else project.finalize_mode,
                     }
                 ),
                 status="CREATED",
@@ -396,7 +406,17 @@ class ReviewWorker:
             )
             gate_passed = self._candidate_passes(project, response, checks)
             if gate_passed:
-                self._save_result(task_id, response, checks)
+                mode = snapshot.get("finalize_mode", "dry_run")
+                if mode == "apply_to_project":
+                    self._save_result(
+                        task_id,
+                        response,
+                        checks,
+                        final_status_override="FINALIZING",
+                    )
+                    await self._finalize(task_id)
+                else:
+                    self._save_result(task_id, response, checks)
                 break
             fixer_data = snapshot.get("fixer")
             limits = snapshot["limits"]
@@ -461,7 +481,8 @@ class ReviewWorker:
                 self._save_result(task_id, response, checks)
                 break
         task, project = self._load(task_id)
-        if task.status == "COMPLETED":
+        mode = json.loads(task.snapshot_json).get("finalize_mode", "dry_run")
+        if task.status == "COMPLETED" and mode != "branch":
             try:
                 git(project.root, "worktree", "remove", task.worktree_path)
             except HubError:
@@ -540,6 +561,177 @@ class ReviewWorker:
             and (not project.gate.require_acceptance or acceptance_passed)
             and checks["worktree_clean"]
         )
+
+    async def _finalize(self, task_id: str) -> None:
+        from app.paths import resolve_inside
+
+        task, project = self._load(task_id)
+        root = Path(project.root)
+        worktree = Path(task.worktree_path)
+        task_dir = Path(task.task_path)
+        apply_record = None
+        try:
+            if head(root) != task.base_commit:
+                raise HubError("target_changed", "Project HEAD changed before finalization", 409)
+            require_clean(root)
+            require_clean(worktree)
+            changed = (
+                git(
+                    worktree,
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    task.base_commit,
+                    "HEAD",
+                    "--",
+                )
+                .decode("utf-8")
+                .split("\0")
+            )
+            paths = [path for path in changed if path]
+            for path in paths:
+                resolve_inside(root, path)
+                if project.target_paths and not any(
+                    path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/")
+                    for prefix in project.target_paths
+                ):
+                    raise HubError(
+                        "apply_failed", f"Changed path is outside target_paths: {path}", 409
+                    )
+            if not paths:
+                self._transition(task_id, "COMPLETED", stop_reason="gate_passed")
+                return
+            backup_dir = task_dir / "backup" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            records = []
+            for path in paths:
+                target = Path(root) / path
+                if target.exists() and not target.is_file():
+                    raise HubError("apply_failed", f"Target is not a regular file: {path}", 409)
+                before = target.read_bytes() if target.exists() else None
+                snapshot_path = backup_dir / path
+                if before is not None:
+                    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                    snapshot_path.write_bytes(before)
+                records.append(
+                    {
+                        "path": path,
+                        "before": hashlib.sha256(before).hexdigest()
+                        if before is not None
+                        else None,
+                        "after": None,
+                        "existed": before is not None,
+                    }
+                )
+            patch = git(
+                worktree, "diff", "--binary", "--no-ext-diff", task.base_commit, "HEAD", "--"
+            )
+            git(root, "apply", "--check", "--whitespace=nowarn", input_bytes=patch)
+            git(root, "apply", "--whitespace=nowarn", input_bytes=patch)
+            for record in records:
+                target = root / record["path"]
+                after = target.read_bytes() if target.exists() else None
+                record["after"] = hashlib.sha256(after).hexdigest() if after is not None else None
+            apply_record = {
+                "status": "applied",
+                "base_commit": task.base_commit,
+                "before_head": task.base_commit,
+                "after_head": head(root),
+                "backup_dir": str(backup_dir),
+                "files": records,
+            }
+            (task_dir / "apply.json").write_text(
+                json.dumps(apply_record, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            self._refresh_result_archive(task_dir)
+            acceptance = project.acceptance_command
+            if acceptance:
+                env_names = [p.api_key_env for p in self.settings.models.providers if p.api_key_env]
+                result = await run_check(acceptance, root, 1200, task_id, env_names)
+                if not result["passed"]:
+                    self._restore_apply(root, apply_record)
+                    apply_record["status"] = "rolled_back"
+                    apply_record["verify"] = result
+                    (task_dir / "apply.json").write_text(
+                        json.dumps(apply_record, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    self._refresh_result_archive(task_dir)
+                    self._transition(task_id, "NEEDS_ATTENTION", stop_reason="verify_failed")
+                    return
+            self._transition(task_id, "COMPLETED", stop_reason="gate_passed")
+        except HubError:
+            if apply_record is not None and apply_record.get("status") == "applied":
+                self._restore_apply(root, apply_record)
+                apply_record["status"] = "rolled_back"
+                (task_dir / "apply.json").write_text(
+                    json.dumps(apply_record, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                self._refresh_result_archive(task_dir)
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise HubError(
+                "apply_failed", "Could not finalize changes in the project", 409
+            ) from exc
+
+    @staticmethod
+    def _restore_apply(root: Path, record: dict) -> None:
+        for item in record["files"]:
+            target = root / item["path"]
+            snapshot = Path(record["backup_dir"]) / item["path"]
+            if item["existed"]:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(snapshot.read_bytes())
+            elif target.exists():
+                target.unlink()
+
+    @staticmethod
+    def _refresh_result_archive(task_dir: Path) -> None:
+        result_dir = task_dir / "result"
+        archive_path = result_dir / "result.zip"
+        if not result_dir.is_dir():
+            return
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for file in result_dir.iterdir():
+                if file.is_file() and file != archive_path:
+                    archive.write(file, file.name)
+            apply_path = task_dir / "apply.json"
+            if apply_path.is_file():
+                archive.write(apply_path, "apply.json")
+
+    def rollback(self, task_id: str) -> ReviewTask:
+        task, project = self._load(task_id)
+        apply_path = Path(task.task_path) / "apply.json"
+        if not apply_path.is_file():
+            raise HubError("rollback_unavailable", "No successful finalization is available", 409)
+        record = json.loads(apply_path.read_text(encoding="utf-8"))
+        if record.get("status") != "applied":
+            raise HubError(
+                "rollback_unavailable", "The latest finalization is already rolled back", 409
+            )
+        root = Path(project.root)
+        for item in record["files"]:
+            target = root / item["path"]
+            current = target.read_bytes() if target.exists() else None
+            current_hash = hashlib.sha256(current).hexdigest() if current is not None else None
+            if current_hash != item["after"]:
+                raise HubError(
+                    "rollback_conflict",
+                    f"Project file changed after finalization: {item['path']}",
+                    409,
+                )
+        self._restore_apply(root, record)
+        record["status"] = "rolled_back"
+        apply_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._refresh_result_archive(Path(task.task_path))
+        with self.session_factory() as session:
+            stored = session.get(ReviewTask, task_id)
+            if stored:
+                stored.stop_reason = "rolled_back"
+                session.commit()
+                session.expunge(stored)
+                return stored
+        raise HubError("task_not_found", "Review task was not found", 404)
 
     @staticmethod
     def _test_command(project, task):
@@ -751,6 +943,7 @@ class ReviewWorker:
         response,
         checks: dict,
         stop_reason_override: str | None = None,
+        final_status_override: str | None = None,
     ) -> str:
         task, project = self._load(task_id)
         task_dir = Path(task.task_path)
@@ -809,7 +1002,11 @@ class ReviewWorker:
         if not response.patch:
             try:
                 cumulative = git(
-                    Path(task.worktree_path), "diff", "--no-ext-diff", task.base_commit
+                    Path(task.worktree_path),
+                    "diff",
+                    "--no-ext-diff",
+                    task.base_commit,
+                    "HEAD",
                 )
             except HubError:
                 cumulative = b""
@@ -838,7 +1035,9 @@ class ReviewWorker:
             and checks["worktree_clean"]
             and budget_reason is None
         )
-        final_status = "NEEDS_ATTENTION" if not gate_passed else "COMPLETED"
+        final_status = final_status_override or (
+            "NEEDS_ATTENTION" if not gate_passed else "COMPLETED"
+        )
         stop_reason = stop_reason_override or (
             budget_reason
             if budget_reason
@@ -875,8 +1074,8 @@ class ReviewWorker:
                 + ("passed" if checks["display_verified"] else "not verified"),
                 f"Usage estimated: {checks['usage_estimated']}",
                 "",
-                "Changes were applied only in the isolated task worktree; "
-                "the original project remains unchanged.",
+                "Changes were validated in the isolated task worktree; "
+                "applying tasks may additionally record a project backup.",
             ]
         )
         (result_dir / "report.md").write_text("\n".join(report_lines), encoding="utf-8")

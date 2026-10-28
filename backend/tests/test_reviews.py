@@ -441,3 +441,183 @@ def test_fixer_applies_change_and_reviewer_runs_again_in_isolated_worktree(tmp_p
             for item in client.get(f"/api/reviews/{accepted.json()['id']}/model-calls").json()
         ] == ["reviewer", "fixer", "reviewer"]
     assert (root / "example.py").read_text(encoding="utf-8") == before
+
+
+def test_non_dry_run_applies_and_rolls_back_the_verified_change(tmp_path) -> None:
+    async def handler(request):
+        payload = json.loads(request.content)
+        user = payload["messages"][-1]["content"]
+        task_id = re.search(r"task_id=(REV-[0-9-]+)", user)[1]
+        round_no = int(re.search(r"round=(\d+)", user)[1])
+        is_fixer = "Apply only the smallest changes" in payload["messages"][0]["content"]
+        if is_fixer:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "Fixed",
+                "findings": [],
+                "edits": [{"path": "example.py", "content": "VALUE = 2\n"}],
+            }
+        elif round_no == 1:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "Needs a fix",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "severity": "P1",
+                        "file": "example.py",
+                        "line": 1,
+                        "title": "Wrong value",
+                    }
+                ],
+            }
+        else:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "approved",
+                "summary": "Approved",
+                "findings": [],
+            }
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(body)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    test_command = (
+        'python -c "from pathlib import Path; '
+        "raise SystemExit(Path('example.py').read_text() != 'VALUE = 2\\n')\""
+    )
+    app, root = make_review_app(
+        tmp_path,
+        handler,
+        test_command=test_command,
+        acceptance_command=test_command,
+        fixer={"provider": "fake", "model": "review"},
+        limits={"max_rounds": 3, "max_fix_attempts_per_round": 1},
+    )
+    with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {app.state.http_token}"
+        accepted = client.post(
+            "/api/reviews",
+            json={"project_id": "demo", "scope": {"mode": "all"}, "dry_run": False},
+        )
+        assert accepted.status_code == 202, accepted.text
+        task_id = accepted.json()["id"]
+        result = wait_for_review(client, task_id)
+        assert result["status"] == "COMPLETED", result
+        assert (root / "example.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+        applied = json.loads((tmp_path / "data/tasks" / task_id / "apply.json").read_text())
+        assert applied["status"] == "applied"
+        with zipfile.ZipFile(tmp_path / "data/tasks" / task_id / "result/result.zip") as archive:
+            assert "apply.json" in archive.namelist()
+        rolled_back = client.post(f"/api/reviews/{task_id}/rollback")
+        assert rolled_back.status_code == 200, rolled_back.text
+        assert rolled_back.json()["stop_reason"] == "rolled_back"
+    assert (root / "example.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_finalization_verification_failure_restores_project(tmp_path, monkeypatch) -> None:
+    import app.task_service
+
+    checks = 0
+    original_run_check = app.task_service.run_check
+
+    async def fail_final_acceptance(command, cwd, timeout, task_id, secret_env_names):
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            return {
+                "command": command,
+                "passed": False,
+                "exit_code": 1,
+                "timed_out": False,
+                "output": "boom",
+            }
+        return await original_run_check(command, cwd, timeout, task_id, secret_env_names)
+
+    monkeypatch.setattr(app.task_service, "run_check", fail_final_acceptance)
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        user = payload["messages"][-1]["content"]
+        task_id = re.search(r"task_id=(REV-[0-9-]+)", user)[1]
+        round_no = int(re.search(r"round=(\d+)", user)[1])
+        is_fixer = "Apply only the smallest changes" in payload["messages"][0]["content"]
+        if is_fixer:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "Fixed",
+                "findings": [],
+                "edits": [{"path": "example.py", "content": "VALUE = 2\n"}],
+            }
+        elif round_no == 1:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "Needs a fix",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "severity": "P1",
+                        "file": "example.py",
+                        "line": 1,
+                        "title": "Wrong value",
+                    }
+                ],
+            }
+        else:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "approved",
+                "summary": "Approved",
+                "findings": [],
+            }
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(body)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    test_command = (
+        'python -c "from pathlib import Path; '
+        "raise SystemExit(Path('example.py').read_text() != 'VALUE = 2\\n')\""
+    )
+    app, root = make_review_app(
+        tmp_path,
+        handler,
+        test_command=test_command,
+        acceptance_command="exit 0",
+        fixer={"provider": "fake", "model": "review"},
+        limits={"max_rounds": 3, "max_fix_attempts_per_round": 1},
+    )
+    before = (root / "example.py").read_bytes()
+    with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {app.state.http_token}"
+        accepted = client.post(
+            "/api/reviews",
+            json={"project_id": "demo", "scope": {"mode": "all"}, "dry_run": False},
+        )
+        result = wait_for_review(client, accepted.json()["id"])
+        assert result["status"] == "NEEDS_ATTENTION"
+        assert result["stop_reason"] == "verify_failed"
+        assert (root / "example.py").read_bytes() == before

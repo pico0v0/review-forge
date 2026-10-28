@@ -26,6 +26,7 @@ cookie. The root README includes a PowerShell submission example.
 | GET | `/api/reviews/{id}/rounds` | Inspect persisted review findings |
 | GET | `/api/reviews/{id}/model-calls` | Inspect recorded model usage and cost |
 | POST | `/api/reviews/{id}/cancel` | Cancel an active task |
+| POST | `/api/reviews/{id}/rollback` | Roll back the latest verified application |
 | GET | `/api/reviews/{id}/report` | Read the Markdown result report |
 | GET | `/api/reviews/{id}/findings` | Read result findings as JSON |
 | GET | `/api/reviews/{id}/validation` | Read check results and bounded output |
@@ -40,11 +41,13 @@ Without an acceptance command the report marks display verification as absent.
 
 ## Current Boundaries
 
-- `dry_run: false` is rejected. When a fixer is configured, blocking findings or
-  failed tests trigger bounded fixer attempts. Patches and complete-file edits
-  are scope-checked, tested, committed at most once per round, and followed by a
-  fresh review. All changes stay in the task worktree; final apply/rollback to
-  the original project is an M3 feature.
+- `dry_run` defaults to `true`. With `dry_run: false`, a task uses the project's
+  `finalize_mode`: `apply_to_project` applies the task diff with backups and
+  verification, `branch` leaves the task branch for manual merge, and `dry_run`
+  never touches the original project. When a fixer is configured, blocking
+  findings or failed tests trigger bounded fixer attempts. Patches and complete-file
+  edits are scope-checked, tested, committed at most once per round, and followed
+  by a fresh review. Applying tasks can be rolled back while file hashes match.
 - The default requires a clean project. If that check is disabled, review still
   uses committed files from HEAD; local edits and untracked files are not copied.
   Context selection uses tracked files, include/exclude patterns, and the selected

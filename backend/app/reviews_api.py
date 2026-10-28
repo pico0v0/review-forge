@@ -174,3 +174,9 @@ async def cancel(task_id: str, request: Request) -> dict:
     find_task(request, task_id)
     await request.app.state.review_worker.cancel(task_id)
     return task_response(find_task(request, task_id))
+
+
+@router.post("/{task_id}/rollback")
+def rollback(task_id: str, request: Request) -> dict:
+    request.app.state.review_worker.rollback(task_id)
+    return task_response(find_task(request, task_id))

@@ -14,7 +14,7 @@ run in isolated worktrees, record reviewer and fixer model usage, apply validate
 patches or file edits only inside the task worktree, run configured tests and
 acceptance checks, then re-review until the gate passes or a bounded stop is
 reached. Final apply/rollback to the original project, MCP, and the web console
-are still to come. See
+MCP and the web console are still to come. See
 [the development specification](docs/开发文档.md) for the planned architecture,
 protocols, quality gates, and milestones. The V1 document is retained as history.
 
@@ -49,7 +49,8 @@ security:
   code_egress_acknowledged: true
 ```
 
-The current API only accepts read-only `dry_run` reviews. A review requires an
+The API defaults to read-only `dry_run` reviews. Set `dry_run: false` to enable
+the project's finalization mode after the isolated gate passes. A review requires an
 enabled Git project, a configured reviewer model, and a reviewer prompt stored
 inside the Hub directory. Register a project and start a full-project review with
 the authenticated API:
@@ -76,7 +77,7 @@ $task = Invoke-RestMethod -Method Post -Uri "$base/api/reviews" -Headers $header
 do {
   Start-Sleep -Seconds 2
   $task = Invoke-RestMethod -Uri "$base/api/reviews/$($task.id)" -Headers $headers
-} while ($task.status -in @('CREATED', 'BUILDING_CONTEXT', 'REVIEWING', 'FIXING', 'VALIDATING'))
+} while ($task.status -in @('CREATED', 'BUILDING_CONTEXT', 'REVIEWING', 'FIXING', 'VALIDATING', 'FINALIZING'))
 Invoke-WebRequest -Uri "$base/api/reviews/$($task.id)/report" -Headers $headers `
   -OutFile "$($task.id)-report.md"
 ```
@@ -87,7 +88,10 @@ validation results, and result archive from that task's endpoints. `scope.mode`
 can be `all`, `paths`, `module`, or `diff`; diff reviews need a project
 `default_base_ref` or an explicit `scope.base_ref`. The default diff base is
 `HEAD`, which has no changes in the default clean-worktree mode. Configured test
-and acceptance commands run in the isolated review worktree.
+and acceptance commands run in the isolated review worktree. Applying tasks also
+run acceptance against the real project; failed final verification restores saved
+snapshots. Use `POST /api/reviews/{task_id}/rollback` to roll back the latest
+successful application when affected files have not changed.
 
 ## Backend Checks
 
