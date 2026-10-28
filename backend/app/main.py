@@ -13,12 +13,15 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.auth import COOKIE_NAME, create_runtime_token, require_auth
-from app.config import AppSettings, default_config_dir, load_settings
+from app.config import AppSettings, default_config_dir, load_settings, resolve_api_key
+from app.database_migrations import migrate
 from app.db import database_url_for, make_engine, make_session_factory
 from app.errors import HubError
-from app.migrations import migrate
+from app.logging_setup import install_log_handler, remove_log_handler
 from app.projects import ProjectConfig, ProjectConfigError, ProjectRegistry
 from app.providers import ModelGateway
+from app.reviews_api import router as reviews_router
+from app.task_service import ReviewWorker, TaskService
 
 
 def create_app(
@@ -45,12 +48,24 @@ def create_app(
         except Timeout as exc:
             raise RuntimeError("A ReviewForge instance already owns this data directory") from exc
         try:
+            log_handler = install_log_handler(resolved_settings.paths.data_dir)
             migrate(resolved_engine)
             _app.state.http_token = create_runtime_token(resolved_settings.paths.data_dir)
+            _app.state.review_worker = ReviewWorker(
+                session_factory,
+                resolved_settings,
+                _app.state.project_registry,
+                _app.state.model_gateway,
+            )
+            _app.state.review_worker.recover()
             yield
         finally:
+            if hasattr(_app.state, "review_worker"):
+                await _app.state.review_worker.shutdown()
             resolved_engine.dispose()
             lock.release()
+            if "log_handler" in locals():
+                remove_log_handler(log_handler)
 
     app = FastAPI(
         title="ReviewForge",
@@ -64,8 +79,13 @@ def create_app(
     app.state.project_registry = ProjectRegistry(resolved_config_dir)
     app.state.model_gateway = ModelGateway(
         resolved_settings.models.providers,
+        key_resolver=lambda provider: resolve_api_key(provider, config_dir=resolved_config_dir),
         max_response_bytes=resolved_settings.security.max_response_bytes,
     )
+    app.state.task_service = TaskService(
+        session_factory, resolved_settings, app.state.project_registry
+    )
+    app.include_router(reviews_router)
 
     @app.exception_handler(HubError)
     async def hub_error_handler(_request: Request, exc: HubError) -> JSONResponse:

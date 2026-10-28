@@ -83,6 +83,7 @@ class ProjectConfig(BaseModel):
     test_command: str | None = None
     acceptance_command: str | None = None
     finalize_mode: Literal["apply_to_project", "dry_run", "branch"] = "apply_to_project"
+    egress_allowed: bool = True
     max_patch_files: int = Field(default=50, ge=1, le=1000)
     include: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
@@ -200,7 +201,8 @@ class ProjectRegistry:
             raise
 
     def _dump(self, project: ProjectConfig) -> dict[str, object]:
-        dumped = project.model_dump(mode="json")
+        # Preserve inheritance: writing defaults would turn them into project overrides on reload.
+        dumped = project.model_dump(mode="json", exclude_unset=True)
         root = Path(dumped["root"])
         dumped["root"] = str(root)
         return dumped
@@ -224,8 +226,15 @@ class ProjectRegistry:
         if Path(result.stdout.strip()).resolve() != project.root:
             raise ProjectConfigError("Project root must match the Git repository root")
 
-        prompt = Path(project.review_prompt).expanduser()
-        if not prompt.is_absolute():
-            prompt = self.hub_root / prompt
+        prompt = self.resolve_review_prompt(project)
         if not prompt.is_file():
             raise ProjectConfigError(f"Review prompt does not exist: {prompt}")
+
+    def resolve_review_prompt(self, project: ProjectConfig) -> Path:
+        prompt = Path(project.review_prompt).expanduser()
+        if prompt.is_absolute():
+            raise ProjectConfigError("Review prompt must be relative to the Hub root")
+        resolved = (self.hub_root / prompt).resolve()
+        if not resolved.is_relative_to(self.hub_root):
+            raise ProjectConfigError("Review prompt must stay inside the Hub root")
+        return resolved

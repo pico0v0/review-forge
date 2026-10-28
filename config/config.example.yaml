@@ -24,3 +24,15 @@ models:
   roles:
     reviewer: {provider: relay, model: your-model-id}
     fixer: {provider: relay, model: your-model-id}
+context:
+  max_file_bytes: 200000
+  max_total_bytes: 8000000
+limits:
+  max_rounds: 3
+  max_fix_attempts_per_round: 2
+  max_total_tokens: 1000000
+  max_cost_usd: 5
+  max_wall_time_min: 120
+automation:
+  require_clean_worktree: true
+  max_parallel_tasks: 1

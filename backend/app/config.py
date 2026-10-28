@@ -122,6 +122,30 @@ class ModelsSettings(BaseModel):
     roles: RolesSettings = Field(default_factory=RolesSettings)
 
 
+class ContextSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_file_bytes: int = Field(default=200_000, gt=0)
+    max_total_bytes: int = Field(default=8_000_000, gt=0)
+
+
+class GlobalLimitSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_rounds: int = Field(default=3, ge=1, le=100)
+    max_fix_attempts_per_round: int = Field(default=2, ge=0, le=20)
+    max_total_tokens: int = Field(default=1_000_000, ge=0)
+    max_cost_usd: float = Field(default=5, ge=0)
+    max_wall_time_min: int = Field(default=120, ge=1, le=7 * 24 * 60)
+
+
+class AutomationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    require_clean_worktree: bool = True
+    max_parallel_tasks: int = Field(default=1, ge=1, le=16)
+
+
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AIH_",
@@ -134,6 +158,9 @@ class AppSettings(BaseSettings):
     paths: PathsSettings = Field(default_factory=PathsSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     models: ModelsSettings = Field(default_factory=ModelsSettings)
+    context: ContextSettings = Field(default_factory=ContextSettings)
+    limits: GlobalLimitSettings = Field(default_factory=GlobalLimitSettings)
+    automation: AutomationSettings = Field(default_factory=AutomationSettings)
 
     @classmethod
     def settings_customise_sources(
