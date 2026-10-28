@@ -12,6 +12,10 @@ reviewer provider and project, set `security.code_egress_acknowledged: true`, an
 set the configured provider's API key environment variable before submitting a
 read-only `dry_run` review.
 
+Agent integrations can start `python backend/mcp/server.py` as an MCP stdio
+server. Set `AIH_CONFIG_DIR` when the Hub uses a non-default config directory;
+the server reads the local runtime token and never opens the Hub database.
+
 ## Review API
 
 All review endpoints require the local Bearer token or authenticated session

@@ -14,7 +14,8 @@ run in isolated worktrees, record reviewer and fixer model usage, apply validate
 patches or file edits only inside the task worktree, run configured tests and
 acceptance checks, then re-review until the gate passes or a bounded stop is
 reached. Final apply/rollback to the original project, MCP, and the web console
-MCP and the web console are still to come. See
+The repository also includes an MCP stdio client for Agent integrations;
+the web console is still to come. See
 [the development specification](docs/开发文档.md) for the planned architecture,
 protocols, quality gates, and milestones. The V1 document is retained as history.
 
@@ -40,6 +41,10 @@ The default data directory is `~/.reviewforge/data`.
 authenticated `GET /api/session` establishes an HttpOnly, SameSite=Strict cookie.
 The token rotates when the Hub starts. Interactive API docs are available at
 `http://127.0.0.1:8787/docs`.
+
+Configure an MCP client with `python backend/mcp/server.py` after starting the
+Hub. The server exposes submit, status, wait, result, history, cancel, models,
+and finding-instruction tools and only communicates with the Hub over HTTP.
 
 Before submitting code, configure a provider in `config/config.yaml`, set its key
 environment variable, and explicitly acknowledge code egress:
