@@ -26,12 +26,13 @@ from app.validation import run_check
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_STATES = {"CREATED", "BUILDING_CONTEXT", "REVIEWING", "VALIDATING"}
+ACTIVE_STATES = {"CREATED", "BUILDING_CONTEXT", "REVIEWING", "FIXING", "VALIDATING"}
 TRANSITIONS = {
     "CREATED": {"BUILDING_CONTEXT", "NEEDS_ATTENTION", "CANCELLED"},
     "BUILDING_CONTEXT": {"REVIEWING", "NEEDS_ATTENTION", "CANCELLED"},
     "REVIEWING": {"VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
-    "VALIDATING": {"COMPLETED", "NEEDS_ATTENTION", "CANCELLED"},
+    "FIXING": {"REVIEWING", "VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
+    "VALIDATING": {"FIXING", "REVIEWING", "COMPLETED", "NEEDS_ATTENTION", "CANCELLED"},
 }
 TASK_ID_PATTERN = re.compile(r"^REV-\d{8}-\d{3,}$")
 
@@ -190,6 +191,7 @@ class TaskService:
                         "project": project.model_dump(mode="json", exclude_unset=True),
                         "limits": effective_limits,
                         "reviewer": reviewer.model_dump(mode="json"),
+                        "fixer": fixer.model_dump(mode="json") if fixer else None,
                         "dry_run": True,
                     }
                 ),
@@ -357,7 +359,115 @@ class ReviewWorker:
 
     async def _review(self, task_id: str) -> None:
         self._prepare(task_id)
+        round_no = 1
+        seen_reviews: dict[str, int] = {}
+        while True:
+            task, project = self._load(task_id)
+            snapshot = json.loads(task.snapshot_json)
+            response, checks, within_budget = await self._review_round(task, project, round_no)
+            signature = json.dumps(
+                {
+                    "verdict": response.verdict,
+                    "findings": [
+                        (finding.id, finding.severity, finding.file, finding.line)
+                        for finding in response.findings
+                    ],
+                },
+                sort_keys=True,
+            )
+            seen_reviews[signature] = seen_reviews.get(signature, 0) + 1
+            if not within_budget:
+                self._save_result(task_id, response, checks)
+                break
+            if (
+                seen_reviews[signature] >= snapshot["limits"].get("no_progress_rounds", 2)
+                and round_no > 1
+            ):
+                self._save_result(task_id, response, checks, stop_reason_override="no_progress")
+                break
+            blocking = any(
+                f.severity in project.gate.blocking_severities for f in response.findings
+            )
+            tests_failed = bool(checks["tests"] and not checks["tests"]["passed"])
+            needs_fix = (
+                blocking
+                or response.verdict in {"blocked", "needs_info", "changes_required"}
+                or tests_failed
+            )
+            gate_passed = self._candidate_passes(project, response, checks)
+            if gate_passed:
+                self._save_result(task_id, response, checks)
+                break
+            fixer_data = snapshot.get("fixer")
+            limits = snapshot["limits"]
+            if not needs_fix or not fixer_data or round_no >= task.max_rounds:
+                self._save_result(task_id, response, checks)
+                break
+            fixed = False
+            for attempt in range(1, limits["max_fix_attempts_per_round"] + 1):
+                good_commit = head(Path(task.worktree_path))
+                try:
+                    fixer_response = await self._fix(
+                        task, project, response, checks, round_no, attempt
+                    )
+                    if not self._apply_changes(task, project, fixer_response):
+                        continue
+                    env_names = [
+                        p.api_key_env for p in self.settings.models.providers if p.api_key_env
+                    ]
+                    if not checks["tests_configured"]:
+                        from app.git import reset_to
+
+                        reset_to(Path(task.worktree_path), good_commit)
+                        break
+                    test_result = await run_check(
+                        self._test_command(project, task),
+                        Path(task.worktree_path),
+                        900,
+                        task.id,
+                        env_names,
+                    )
+                    if test_result["passed"]:
+                        from app.git import commit_files
+
+                        status = git(
+                            Path(task.worktree_path),
+                            "status",
+                            "--porcelain=v1",
+                            "--untracked-files=all",
+                        )
+                        if status:
+                            commit_files(
+                                Path(task.worktree_path),
+                                ["."],
+                                f"{task_id} round {round_no}: "
+                                f"fix {len(response.findings)} findings",
+                            )
+                        fixed = True
+                        break
+                    from app.git import reset_to
+
+                    reset_to(Path(task.worktree_path), good_commit)
+                    checks["tests"] = test_result
+                except HubError as exc:
+                    logger.info("Fix attempt %s for %s rejected: %s", attempt, task_id, exc.code)
+            if not fixed:
+                self._save_result(
+                    task_id, response, checks, stop_reason_override="fix_attempts_exhausted"
+                )
+                break
+            round_no += 1
+            if round_no > task.max_rounds:
+                self._save_result(task_id, response, checks)
+                break
         task, project = self._load(task_id)
+        if task.status == "COMPLETED":
+            try:
+                git(project.root, "worktree", "remove", task.worktree_path)
+            except HubError:
+                logger.warning("Completed task %s retains its worktree for cleanup", task_id)
+
+    async def _review_round(self, task, project, round_no):
         snapshot = json.loads(task.snapshot_json)
         role = ModelRoleSettings.model_validate(snapshot["reviewer"])
         prompt = self._prompt(project)
@@ -366,60 +476,23 @@ class ReviewWorker:
             Path(task.worktree_path),
             json.loads(task.scope_json),
             Path(task.task_path),
-            task_id,
-            1,
-            task.review_base,
+            task.id,
+            round_no,
+            task.base_commit,
             max_bytes=min(self.settings.context.max_total_bytes, 400_000),
             max_file_bytes=self.settings.context.max_file_bytes,
             review_type=task.review_type,
         )
-        provider = next(p for p in self.settings.models.providers if p.id == role.provider)
-        model = next(m for m in provider.models if m.id == role.model)
-        # Bytes provide a conservative ceiling for common byte-level tokenizers.
-        input_bound = len((context.text + prompt).encode("utf-8")) + 4096
-        limits = snapshot["limits"]
-        available = min(model.context_window, limits["max_total_tokens"]) - input_bound
-        output_limit = min(model.max_output_tokens, 16_000, available)
-        if output_limit <= 0:
-            raise HubError("budget_tokens", "Input and reserved output exceed the token budget")
-        reserve_cost = (
-            input_bound * model.input_usd_per_1m + output_limit * model.output_usd_per_1m
-        ) / 1_000_000
-        if reserve_cost > limits["max_cost_usd"]:
-            raise HubError("budget_cost", "Estimated call cost exceeds the remaining budget")
-        self._transition(task_id, "REVIEWING", message="Review context is ready")
-        response, call = await self.gateway.review(
-            role,
-            task_id=task_id,
-            round_no=1,
-            system_prompt=prompt,
-            context=f"Review type: {task.review_type}\n{context.text}",
-            max_output_tokens=output_limit,
+        self._transition(task.id, "REVIEWING", message=f"Reviewer started round {round_no}")
+        response, call, within_budget = await self._call_model(
+            task, role, prompt, context.text, round_no, "reviewer"
         )
-        prompt_tokens = call.get("prompt_tokens")
-        completion_tokens = call.get("completion_tokens")
-        call["prompt_tokens"] = input_bound if prompt_tokens is None else int(prompt_tokens)
-        call["completion_tokens"] = (
-            len(response.model_dump_json().encode("utf-8"))
-            if completion_tokens is None
-            else int(completion_tokens)
-        )
-        # Persist paid usage before awaiting checks, which can be interrupted independently.
-        self._record_review(task_id, response, call)
-        actual_cost = (
-            call["prompt_tokens"] * model.input_usd_per_1m
-            + call["completion_tokens"] * model.output_usd_per_1m
-        ) / 1_000_000
-        within_budget = (
-            call["prompt_tokens"] + call["completion_tokens"] <= limits["max_total_tokens"]
-            and actual_cost <= limits["max_cost_usd"]
-        )
-        command = project.test_command
+        self._record_review(task.id, response, call, round_no, "reviewer")
+        command = self._test_command(project, task)
         acceptance = project.acceptance_command
         if json.loads(task.scope_json)["mode"] == "module":
             scope = json.loads(task.scope_json)
             module = next(m for m in project.modules if m.id == scope["module_id"])
-            command = module.test_command or command
             acceptance = module.acceptance_command or acceptance
         checks = {
             "tests": None,
@@ -431,29 +504,179 @@ class ReviewWorker:
             "usage_estimated": not bool(call.get("usage_reported")),
             "omitted": context.omitted,
         }
-        blocking = any(f.severity in project.gate.blocking_severities for f in response.findings)
-        self._transition(task_id, "VALIDATING", message="Validating review result")
-        if within_budget and not blocking and response.verdict not in {"blocked", "needs_info"}:
+        self._transition(task.id, "VALIDATING", message="Validating review result")
+        if (
+            within_budget
+            and not any(f.severity in project.gate.blocking_severities for f in response.findings)
+            and response.verdict not in {"blocked", "needs_info", "changes_required"}
+        ):
             env_names = [p.api_key_env for p in self.settings.models.providers if p.api_key_env]
             if command:
                 checks["tests"] = await run_check(
-                    command, Path(task.worktree_path), 900, task_id, env_names
+                    command, Path(task.worktree_path), 900, task.id, env_names
                 )
             if acceptance and (not command or checks["tests"]["passed"]):
                 checks["acceptance"] = await run_check(
-                    acceptance, Path(task.worktree_path), 1200, task_id, env_names
+                    acceptance, Path(task.worktree_path), 1200, task.id, env_names
                 )
                 checks["display_verified"] = checks["acceptance"]["passed"]
             try:
                 require_clean(Path(task.worktree_path))
             except HubError:
                 checks["worktree_clean"] = False
-        final_status = self._save_result(task_id, response, checks)
-        if final_status == "COMPLETED":
-            try:
-                git(project.root, "worktree", "remove", task.worktree_path)
-            except HubError:
-                logger.warning("Completed task %s retains its worktree for cleanup", task_id)
+        return response, checks, within_budget
+
+    def _candidate_passes(self, project, response, checks):
+        tests_passed = checks["tests"] is not None and checks["tests"]["passed"]
+        acceptance_passed = not checks["acceptance_configured"] or (
+            checks["acceptance"] is not None and checks["acceptance"]["passed"]
+        )
+        blocking = any(f.severity in project.gate.blocking_severities for f in response.findings)
+        return (
+            not blocking
+            and response.verdict not in {"blocked", "needs_info", "changes_required"}
+            and (not project.gate.require_verdict or response.verdict == "approved")
+            and (not project.gate.require_tests or tests_passed)
+            and (not project.gate.require_acceptance or acceptance_passed)
+            and checks["worktree_clean"]
+        )
+
+    @staticmethod
+    def _test_command(project, task):
+        command = project.test_command
+        scope = json.loads(task.scope_json)
+        if scope["mode"] == "module":
+            module = next(m for m in project.modules if m.id == scope["module_id"])
+            command = module.test_command or command
+        return command
+
+    async def _call_model(self, task, role, prompt, context, round_no, call_role):
+        task, _project = self._load(task.id)
+        provider = next(p for p in self.settings.models.providers if p.id == role.provider)
+        model = next(m for m in provider.models if m.id == role.model)
+        limits = json.loads(task.snapshot_json)["limits"]
+        input_bound = len((context + prompt).encode("utf-8")) + 4096
+        available = (
+            min(model.context_window, limits["max_total_tokens"] - task.tokens_used) - input_bound
+        )
+        output_limit = min(model.max_output_tokens, 16_000, available)
+        if output_limit <= 0:
+            raise HubError("budget_tokens", "Input and reserved output exceed the token budget")
+        response, call = await self.gateway.review(
+            role,
+            task_id=task.id,
+            round_no=round_no,
+            system_prompt=prompt,
+            context=context,
+            max_output_tokens=output_limit,
+        )
+        call["prompt_tokens"] = (
+            input_bound if call.get("prompt_tokens") is None else int(call["prompt_tokens"])
+        )
+        call["completion_tokens"] = (
+            len(response.model_dump_json().encode())
+            if call.get("completion_tokens") is None
+            else int(call["completion_tokens"])
+        )
+        call["role"] = call_role
+        actual_cost = (
+            call["prompt_tokens"] * model.input_usd_per_1m
+            + call["completion_tokens"] * model.output_usd_per_1m
+        ) / 1_000_000
+        return (
+            response,
+            call,
+            task.tokens_used + call["prompt_tokens"] + call["completion_tokens"]
+            <= limits["max_total_tokens"]
+            and task.cost_usd + actual_cost <= limits["max_cost_usd"],
+        )
+
+    async def _fix(self, task, project, review, checks, round_no, attempt):
+        role = ModelRoleSettings.model_validate(json.loads(task.snapshot_json)["fixer"])
+        prompt_path = self.projects.hub_root / "prompts" / "fixer.md"
+        if not prompt_path.is_file():
+            prompt_path = Path(__file__).resolve().parents[2] / "prompts" / "fixer.md"
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HubError(
+                "config_error", "Could not read the configured fixer prompt", 500
+            ) from exc
+        context = (
+            json.dumps(
+                {
+                    "findings": [f.model_dump(mode="json") for f in review.findings],
+                    "validation": checks,
+                    "attempt": attempt,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + git(Path(task.worktree_path), "diff", "--no-ext-diff").decode(
+                "utf-8", errors="replace"
+            )
+        )
+        self._transition(
+            task.id, "FIXING", message=f"Applying fix attempt {attempt} in round {round_no}"
+        )
+        response, call, within_budget = await self._call_model(
+            task, role, prompt, context, round_no, "fixer"
+        )
+        self._record_review(task.id, response, call, round_no, "fixer", create_round=False)
+        if not within_budget:
+            raise HubError("budget_tokens", "Fixer call exceeded the remaining task budget")
+        return response
+
+    def _apply_changes(self, task, project, response):
+        from app.context import in_scope
+        from app.paths import allowed_source, resolve_inside
+
+        root = Path(task.worktree_path)
+        scope = json.loads(task.scope_json)
+        patterns = scope.get("paths", [])
+        if scope["mode"] == "module":
+            patterns = next(m.paths for m in project.modules if m.id == scope["module_id"])
+        if response.patch:
+            if len(response.patch.encode()) > 2_000_000:
+                raise HubError("patch_too_large", "Fix patch exceeds the size limit")
+            import re
+
+            paths = re.findall(r"^(?:\+\+\+|---) [ab]/(.+)$", response.patch, re.M)
+            names = {path for path in paths if path != "/dev/null"}
+            if (
+                not names
+                or len(names) > project.max_patch_files
+                or any(not allowed_source(p) or not in_scope(p, patterns, project) for p in names)
+            ):
+                raise HubError(
+                    "patch_scope_violation", "Patch contains paths outside the allowed source scope"
+                )
+            git(
+                root, "apply", "--check", "--whitespace=nowarn", input_bytes=response.patch.encode()
+            )
+            git(root, "apply", "--whitespace=nowarn", input_bytes=response.patch.encode())
+            return True
+        if response.edits:
+            if len(response.edits) > project.max_patch_files:
+                raise HubError("patch_too_large", "Too many files in fixer response")
+            for edit in response.edits:
+                if (
+                    not allowed_source(edit.path)
+                    or not in_scope(edit.path, patterns, project)
+                    or len(edit.content.encode()) > self.settings.context.max_file_bytes
+                ):
+                    raise HubError(
+                        "patch_scope_violation", "File edit is outside allowed paths or size"
+                    )
+                target = resolve_inside(root, edit.path)
+                if target.exists() and not target.is_file():
+                    raise HubError("path_unsafe", "Edits can only target regular files")
+            for edit in response.edits:
+                target = resolve_inside(root, edit.path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(edit.content, encoding="utf-8")
+            return True
+        return False
 
     def _prepare(self, task_id: str) -> None:
         task, project = self._load(task_id)
@@ -522,7 +745,13 @@ class ReviewWorker:
         except HubError:
             logger.exception("Failed to record stop reason for %s", task_id)
 
-    def _save_result(self, task_id: str, response, checks: dict) -> str:
+    def _save_result(
+        self,
+        task_id: str,
+        response,
+        checks: dict,
+        stop_reason_override: str | None = None,
+    ) -> str:
         task, project = self._load(task_id)
         task_dir = Path(task.task_path)
         result_dir = task_dir / "result"
@@ -577,6 +806,15 @@ class ReviewWorker:
                 ),
                 encoding="utf-8",
             )
+        if not response.patch:
+            try:
+                cumulative = git(
+                    Path(task.worktree_path), "diff", "--no-ext-diff", task.base_commit
+                )
+            except HubError:
+                cumulative = b""
+            if cumulative:
+                (result_dir / "changes.patch").write_bytes(cumulative)
 
         blocking = any(f.severity in project.gate.blocking_severities for f in response.findings)
         tests_passed = checks["tests"] is not None and checks["tests"]["passed"]
@@ -601,7 +839,7 @@ class ReviewWorker:
             and budget_reason is None
         )
         final_status = "NEEDS_ATTENTION" if not gate_passed else "COMPLETED"
-        stop_reason = (
+        stop_reason = stop_reason_override or (
             budget_reason
             if budget_reason
             else "validation_modified_files"
@@ -637,7 +875,8 @@ class ReviewWorker:
                 + ("passed" if checks["display_verified"] else "not verified"),
                 f"Usage estimated: {checks['usage_estimated']}",
                 "",
-                "This is a read-only review. Proposed changes have not been applied.",
+                "Changes were applied only in the isolated task worktree; "
+                "the original project remains unchanged.",
             ]
         )
         (result_dir / "report.md").write_text("\n".join(report_lines), encoding="utf-8")
@@ -648,9 +887,17 @@ class ReviewWorker:
         self._transition(task_id, final_status, stop_reason=stop_reason)
         return final_status
 
-    def _record_review(self, task_id: str, response, call: dict[str, object]) -> None:
+    def _record_review(
+        self,
+        task_id: str,
+        response,
+        call: dict[str, object],
+        round_no: int = 1,
+        role: str = "reviewer",
+        create_round: bool = True,
+    ) -> None:
         task, _project = self._load(task_id)
-        response_path = Path(task.task_path) / "rounds" / "1" / "response.json"
+        response_path = Path(task.task_path) / "rounds" / str(round_no) / f"{role}-response.json"
         response_path.parent.mkdir(parents=True, exist_ok=True)
         response_path.write_text(response.model_dump_json(indent=2), encoding="utf-8")
         patch_path = None
@@ -666,35 +913,41 @@ class ReviewWorker:
         ) / 1_000_000
         with self.session_factory() as session:
             stored = session.get(ReviewTask, task_id)
-            if stored is None or stored.status != "REVIEWING":
+            if stored is None or stored.status not in {"REVIEWING", "FIXING"}:
                 raise HubError("invalid_state", "Task is no longer reviewing", 409)
-            stored.current_round = 1
-            stored.verdict = response.verdict
-            stored.summary = response.summary
-            stored.tokens_used = prompt_tokens + completion_tokens
-            stored.cost_usd = cost
-            stored.rounds.append(
-                ReviewRound(
-                    round_no=1,
-                    verdict=response.verdict,
-                    summary=response.summary,
-                    findings_json=json.dumps(
-                        [item.model_dump(mode="json") for item in response.findings],
-                        ensure_ascii=False,
-                    ),
-                    request_path=str(
-                        Path(task.task_path) / "rounds" / "1" / "context" / "request.zip"
-                    ),
-                    response_path=str(response_path),
-                    patch_path=str(patch_path) if patch_path else None,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
+            stored.current_round = max(stored.current_round, round_no)
+            if role == "reviewer":
+                stored.verdict = response.verdict
+                stored.summary = response.summary
+            stored.tokens_used += prompt_tokens + completion_tokens
+            stored.cost_usd += cost
+            if create_round:
+                stored.rounds.append(
+                    ReviewRound(
+                        round_no=round_no,
+                        verdict=response.verdict,
+                        summary=response.summary,
+                        findings_json=json.dumps(
+                            [item.model_dump(mode="json") for item in response.findings],
+                            ensure_ascii=False,
+                        ),
+                        request_path=str(
+                            Path(task.task_path)
+                            / "rounds"
+                            / str(round_no)
+                            / "context"
+                            / "request.zip"
+                        ),
+                        response_path=str(response_path),
+                        patch_path=str(patch_path) if patch_path else None,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
                 )
-            )
             stored.model_calls.append(
                 ModelCall(
-                    round_no=1,
-                    role="reviewer",
+                    round_no=round_no,
+                    role=role,
                     provider=str(call["provider"]),
                     model=str(call["model"]),
                     prompt_tokens=prompt_tokens,

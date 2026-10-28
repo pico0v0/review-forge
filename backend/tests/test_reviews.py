@@ -359,3 +359,85 @@ def test_project_roundtrip_preserves_global_limit_inheritance(tmp_path) -> None:
         result = wait_for_review(client, accepted.json()["id"])
         assert result["max_rounds"] == 2
         assert result["stop_reason"] == "budget_tokens"
+
+
+def test_fixer_applies_change_and_reviewer_runs_again_in_isolated_worktree(tmp_path) -> None:
+    calls = []
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        user = payload["messages"][-1]["content"]
+        task_id = re.search(r"task_id=(REV-[0-9-]+)", user)[1]
+        round_no = int(re.search(r"round=(\d+)", user)[1])
+        is_fixer = "Apply only the smallest changes" in payload["messages"][0]["content"]
+        calls.append((is_fixer, round_no))
+        if is_fixer:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "Applied the requested fix",
+                "findings": [],
+                "edits": [{"path": "example.py", "content": "VALUE = 2\n"}],
+            }
+        elif round_no == 1:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "changes_required",
+                "summary": "A change is required",
+                "findings": [
+                    {
+                        "id": "F1",
+                        "severity": "P1",
+                        "file": "example.py",
+                        "line": 1,
+                        "title": "Wrong value",
+                    }
+                ],
+            }
+        else:
+            body = {
+                "schema_version": "2.0",
+                "task_id": task_id,
+                "round": round_no,
+                "verdict": "approved",
+                "summary": "Fixed",
+                "findings": [],
+            }
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(body)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    test_command = (
+        'python -c "from pathlib import Path; '
+        "raise SystemExit(Path('example.py').read_text() != 'VALUE = 2\\n')\""
+    )
+    app, root = make_review_app(
+        tmp_path,
+        handler,
+        test_command=test_command,
+        fixer={"provider": "fake", "model": "review"},
+        limits={"max_rounds": 3, "max_fix_attempts_per_round": 1},
+    )
+    before = (root / "example.py").read_text(encoding="utf-8")
+    with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {app.state.http_token}"
+        accepted = client.post(
+            "/api/reviews", json={"project_id": "demo", "scope": {"mode": "all"}}
+        )
+        result = wait_for_review(client, accepted.json()["id"])
+        assert result["status"] == "COMPLETED", result
+        assert result["current_round"] == 2
+        assert [(False, 1), (True, 1), (False, 2)] == calls
+        assert [
+            item["role"]
+            for item in client.get(f"/api/reviews/{accepted.json()['id']}/model-calls").json()
+        ] == ["reviewer", "fixer", "reviewer"]
+    assert (root / "example.py").read_text(encoding="utf-8") == before

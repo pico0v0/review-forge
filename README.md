@@ -9,11 +9,12 @@ Its planned final apply step only accepts changes that pass the quality gate.
 ## Project Status
 
 The backend currently supports local configuration, Git project registration,
-bounded model connection checks, and a read-only single-round review flow. Review
-tasks run in isolated worktrees, record their model usage and findings, execute
-configured tests and acceptance checks, then archive a Markdown report and result
-ZIP. Automatic repair, final apply/rollback, MCP, and the web console are still to
-come. See
+bounded model connection checks, and a dry-run review/repair loop. Review tasks
+run in isolated worktrees, record reviewer and fixer model usage, apply validated
+patches or file edits only inside the task worktree, run configured tests and
+acceptance checks, then re-review until the gate passes or a bounded stop is
+reached. Final apply/rollback to the original project, MCP, and the web console
+are still to come. See
 [the development specification](docs/开发文档.md) for the planned architecture,
 protocols, quality gates, and milestones. The V1 document is retained as history.
 
@@ -75,7 +76,7 @@ $task = Invoke-RestMethod -Method Post -Uri "$base/api/reviews" -Headers $header
 do {
   Start-Sleep -Seconds 2
   $task = Invoke-RestMethod -Uri "$base/api/reviews/$($task.id)" -Headers $headers
-} while ($task.status -in @('CREATED', 'BUILDING_CONTEXT', 'REVIEWING', 'VALIDATING'))
+} while ($task.status -in @('CREATED', 'BUILDING_CONTEXT', 'REVIEWING', 'FIXING', 'VALIDATING'))
 Invoke-WebRequest -Uri "$base/api/reviews/$($task.id)/report" -Headers $headers `
   -OutFile "$($task.id)-report.md"
 ```

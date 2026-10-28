@@ -66,3 +66,9 @@ def commit_files(root: Path, paths: list[str], message: str) -> None:
         "-m",
         message,
     )
+
+
+def reset_to(root: Path, commit: str) -> None:
+    """Discard generated changes inside a task-owned worktree only."""
+    git(root, "reset", "--hard", commit)
+    git(root, "clean", "-fd")

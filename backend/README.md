@@ -32,7 +32,7 @@ cookie. The root README includes a PowerShell submission example.
 | GET | `/api/reviews/{id}/diff` | Read a model-proposed patch, if present |
 | GET | `/api/reviews/{id}/artifacts/result` | Download the result ZIP |
 
-Tasks progress through `CREATED`, `BUILDING_CONTEXT`, `REVIEWING`, and
+Tasks progress through `CREATED`, `BUILDING_CONTEXT`, `REVIEWING`, `FIXING`, and
 `VALIDATING`, then finish as `COMPLETED`, `NEEDS_ATTENTION`, or `CANCELLED`.
 Only a passed quality gate produces `COMPLETED`. By default P0/P1 findings block
 completion, tests must pass, and any configured acceptance check must pass.
@@ -40,9 +40,11 @@ Without an acceptance command the report marks display verification as absent.
 
 ## Current Boundaries
 
-- Each task reviews the submitted Git commit once. `dry_run: false` is rejected;
-  model proposals are archived without applying them. Repair loops and final
-  apply/rollback are not available yet, even when `max_rounds` exceeds one.
+- `dry_run: false` is rejected. When a fixer is configured, blocking findings or
+  failed tests trigger bounded fixer attempts. Patches and complete-file edits
+  are scope-checked, tested, committed at most once per round, and followed by a
+  fresh review. All changes stay in the task worktree; final apply/rollback to
+  the original project is an M3 feature.
 - The default requires a clean project. If that check is disabled, review still
   uses committed files from HEAD; local edits and untracked files are not copied.
   Context selection uses tracked files, include/exclude patterns, and the selected
@@ -51,8 +53,9 @@ Without an acceptance command the report marks display verification as absent.
   budgets. Project and submission limits can tighten these caps. Token reservations
   use a conservative byte estimate; missing provider usage is estimated and marked
   in validation results. Set actual model prices for meaningful cost enforcement.
-- Review calls currently make one request; automatic provider retries and invalid
-  JSON repair are not implemented. An error or exhausted budget stops the task.
+- Review and fixer calls use the configured round, fix-attempt, token, cost, and
+  wall-time limits. Automatic provider retries and invalid JSON repair are not
+  implemented; an error or exhausted budget stops the task.
 - Restarted tasks become `NEEDS_ATTENTION` with `interrupted`; the Hub does not
   repeat model calls automatically. A valid returned review and its usage remain
   recorded if validation is subsequently cancelled or interrupted. Result reports
