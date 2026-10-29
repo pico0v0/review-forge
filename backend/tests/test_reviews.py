@@ -18,6 +18,7 @@ from app.schemas import ReviewSubmitRequest
 
 
 def make_review_app(tmp_path: Path, handler, **project_options):
+    auto_commit = project_options.pop("auto_commit", False)
     project = tmp_path / "project"
     project.mkdir()
     for args in (
@@ -36,6 +37,7 @@ def make_review_app(tmp_path: Path, handler, **project_options):
     settings = AppSettings(
         paths={"data_dir": tmp_path / "data"},
         security={"code_egress_acknowledged": True},
+        automation={"finalize": {"auto_commit": auto_commit}},
         models={
             "providers": [
                 {"id": "fake", "base_url": "http://127.0.0.1:9999/v1", "models": [{"id": "review"}]}
@@ -443,7 +445,8 @@ def test_fixer_applies_change_and_reviewer_runs_again_in_isolated_worktree(tmp_p
     assert (root / "example.py").read_text(encoding="utf-8") == before
 
 
-def test_non_dry_run_applies_and_rolls_back_the_verified_change(tmp_path) -> None:
+@pytest.mark.parametrize("auto_commit", [False, True])
+def test_non_dry_run_applies_and_rolls_back_the_verified_change(tmp_path, auto_commit) -> None:
     async def handler(request):
         payload = json.loads(request.content)
         user = payload["messages"][-1]["content"]
@@ -505,7 +508,14 @@ def test_non_dry_run_applies_and_rolls_back_the_verified_change(tmp_path) -> Non
         acceptance_command=test_command,
         fixer={"provider": "fake", "model": "review"},
         limits={"max_rounds": 3, "max_fix_attempts_per_round": 1},
+        auto_commit=auto_commit,
     )
+    base_head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     with TestClient(app) as client:
         client.headers["Authorization"] = f"Bearer {app.state.http_token}"
         accepted = client.post(
@@ -519,12 +529,30 @@ def test_non_dry_run_applies_and_rolls_back_the_verified_change(tmp_path) -> Non
         assert (root / "example.py").read_text(encoding="utf-8") == "VALUE = 2\n"
         applied = json.loads((tmp_path / "data/tasks" / task_id / "apply.json").read_text())
         assert applied["status"] == "applied"
+        if auto_commit:
+            assert applied["after_head"] != base_head
+            committed_paths = subprocess.run(
+                ["git", "-C", str(root), "show", "--pretty=", "--name-only", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            assert committed_paths == ["example.py"]
+        else:
+            assert applied["after_head"] == base_head
         with zipfile.ZipFile(tmp_path / "data/tasks" / task_id / "result/result.zip") as archive:
             assert "apply.json" in archive.namelist()
         rolled_back = client.post(f"/api/reviews/{task_id}/rollback")
-        assert rolled_back.status_code == 200, rolled_back.text
-        assert rolled_back.json()["stop_reason"] == "rolled_back"
-    assert (root / "example.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+        if auto_commit:
+            assert rolled_back.status_code == 409
+            assert rolled_back.json()["error"]["code"] == "rollback_conflict"
+            assert "history contains a commit" in rolled_back.json()["error"]["message"]
+        else:
+            assert rolled_back.status_code == 200, rolled_back.text
+            assert rolled_back.json()["stop_reason"] == "rolled_back"
+    assert (root / "example.py").read_text(encoding="utf-8") == (
+        "VALUE = 2\n" if auto_commit else "VALUE = 1\n"
+    )
 
 
 def test_finalization_verification_failure_restores_project(tmp_path, monkeypatch) -> None:
@@ -621,3 +649,64 @@ def test_finalization_verification_failure_restores_project(tmp_path, monkeypatc
         assert result["status"] == "NEEDS_ATTENTION"
         assert result["stop_reason"] == "verify_failed"
         assert (root / "example.py").read_bytes() == before
+
+
+def test_retry_reuses_task_and_continues_round_number(tmp_path) -> None:
+    calls = []
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        user = payload["messages"][-1]["content"]
+        task_id = re.search(r"task_id=(REV-[0-9-]+)", user)[1]
+        round_no = int(re.search(r"round=(\d+)", user)[1])
+        calls.append(round_no)
+        verdict = "changes_required" if round_no == 1 else "approved"
+        body = {
+            "schema_version": "2.0",
+            "task_id": task_id,
+            "round": round_no,
+            "verdict": verdict,
+            "summary": "Retryable" if round_no == 1 else "Approved",
+            "findings": (
+                [
+                    {
+                        "id": "F1",
+                        "severity": "P1",
+                        "file": "example.py",
+                        "line": 1,
+                        "title": "Needs review",
+                    }
+                ]
+                if round_no == 1
+                else []
+            ),
+        }
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(body)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    app, _root = make_review_app(
+        tmp_path,
+        handler,
+        test_command=None,
+        acceptance_command=None,
+        gate={"require_tests": False, "require_acceptance": False},
+    )
+    with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {app.state.http_token}"
+        accepted = client.post(
+            "/api/reviews", json={"project_id": "demo", "scope": {"mode": "all"}}
+        )
+        task_id = accepted.json()["id"]
+        first = wait_for_review(client, task_id)
+        assert first["status"] == "NEEDS_ATTENTION"
+        retried = client.post(f"/api/reviews/{task_id}/retry", json={"limits": {"max_rounds": 3}})
+        assert retried.status_code == 202, retried.text
+        result = wait_for_review(client, task_id)
+        assert result["status"] == "COMPLETED", result
+        assert result["current_round"] == 2
+        assert calls == [1, 2]

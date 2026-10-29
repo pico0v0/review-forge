@@ -9,6 +9,7 @@ def test_defaults_keep_service_on_loopback_and_egress_disabled(tmp_path: Path) -
     settings = load_settings(tmp_path)
     assert settings.server.host == "127.0.0.1"
     assert settings.security.code_egress_acknowledged is False
+    assert settings.automation.finalize.auto_commit is False
     assert settings.paths.data_dir == (Path.home() / ".reviewforge/data").resolve()
 
 

@@ -12,7 +12,7 @@ from sqlalchemy import select
 from app.auth import require_auth
 from app.errors import HubError
 from app.models import ModelCall, ReviewRound, ReviewTask, TaskEvent
-from app.schemas import ReviewSubmitRequest
+from app.schemas import ReviewRetryRequest, ReviewSubmitRequest
 from app.task_service import task_response
 
 router = APIRouter(prefix="/api/reviews", dependencies=[Depends(require_auth)], tags=["reviews"])
@@ -174,6 +174,13 @@ async def cancel(task_id: str, request: Request) -> dict:
     find_task(request, task_id)
     await request.app.state.review_worker.cancel(task_id)
     return task_response(find_task(request, task_id))
+
+
+@router.post("/{task_id}/retry", status_code=202)
+async def retry(task_id: str, payload: ReviewRetryRequest, request: Request) -> dict:
+    task = request.app.state.task_service.retry(task_id, payload)
+    request.app.state.review_worker.schedule(task.id)
+    return task_response(task)
 
 
 @router.post("/{task_id}/rollback")

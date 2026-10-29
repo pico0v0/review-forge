@@ -22,7 +22,7 @@ from app.git import create_worktree, git, head, require_clean
 from app.models import ModelCall, ReviewRound, ReviewTask, TaskEvent, utc_now
 from app.projects import ProjectConfig, ProjectConfigError, ProjectRegistry
 from app.providers import ModelGateway
-from app.schemas import ReviewSubmitRequest
+from app.schemas import ReviewRetryRequest, ReviewSubmitRequest
 from app.validation import run_check
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ ACTIVE_STATES = {
 }
 TRANSITIONS = {
     "CREATED": {"BUILDING_CONTEXT", "NEEDS_ATTENTION", "CANCELLED"},
+    "NEEDS_ATTENTION": {"BUILDING_CONTEXT", "CANCELLED"},
     "BUILDING_CONTEXT": {"REVIEWING", "NEEDS_ATTENTION", "CANCELLED"},
     "REVIEWING": {"VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
     "FIXING": {"REVIEWING", "VALIDATING", "NEEDS_ATTENTION", "CANCELLED"},
@@ -238,6 +239,59 @@ class TaskService:
         if provider is None or role.model not in {model.id for model in provider.models}:
             raise HubError("model_not_configured", "Selected model is not configured", 422)
 
+    def retry(self, task_id: str, request: ReviewRetryRequest) -> ReviewTask:
+        with self.session_factory() as session:
+            task = session.get(ReviewTask, task_id)
+            if task is None:
+                raise HubError("task_not_found", "Review task was not found", 404)
+            if task.status != "NEEDS_ATTENTION":
+                raise HubError("invalid_state", "Only stopped reviews can be retried", 409)
+            snapshot = json.loads(task.snapshot_json)
+            if request.reviewer is not None:
+                self._validate_role(request.reviewer)
+                snapshot["reviewer"] = request.reviewer.model_dump(mode="json")
+                task.reviewer_provider = request.reviewer.provider
+                task.reviewer_model = request.reviewer.model
+            if request.fixer is not None:
+                self._validate_role(request.fixer)
+                snapshot["fixer"] = request.fixer.model_dump(mode="json")
+                task.fixer_provider = request.fixer.provider
+                task.fixer_model = request.fixer.model
+            if request.limits is not None:
+                values = request.limits.model_dump(mode="json", exclude_unset=True)
+                global_limits = self.settings.limits.model_dump(mode="json")
+                snapshot["limits"].update(
+                    {
+                        key: min(value, global_limits[key])
+                        for key, value in values.items()
+                        if key in global_limits
+                    }
+                )
+                task.max_rounds = snapshot["limits"]["max_rounds"]
+            if request.dry_run is not None:
+                snapshot["dry_run"] = request.dry_run
+                snapshot["finalize_mode"] = (
+                    "dry_run"
+                    if request.dry_run
+                    else snapshot.get("project", {}).get("finalize_mode", "apply_to_project")
+                )
+            task.snapshot_json = json.dumps(snapshot)
+            task.stop_reason = None
+            task.error_message = None
+            task.completed_at = None
+            task.status = "BUILDING_CONTEXT"
+            task.events.append(
+                TaskEvent(
+                    event_type="retry_requested",
+                    from_status="NEEDS_ATTENTION",
+                    to_status="BUILDING_CONTEXT",
+                    message="Review retry accepted",
+                )
+            )
+            session.commit()
+            session.refresh(task)
+            return task
+
     @staticmethod
     def _validate_scope_path(path: str) -> None:
         from app.paths import relative_path
@@ -369,7 +423,8 @@ class ReviewWorker:
 
     async def _review(self, task_id: str) -> None:
         self._prepare(task_id)
-        round_no = 1
+        task, _project = self._load(task_id)
+        round_no = max(1, task.current_round + 1)
         seen_reviews: dict[str, int] = {}
         while True:
             task, project = self._load(task_id)
@@ -659,15 +714,39 @@ class ReviewWorker:
                     self._refresh_result_archive(task_dir)
                     self._transition(task_id, "NEEDS_ATTENTION", stop_reason="verify_failed")
                     return
-            self._transition(task_id, "COMPLETED", stop_reason="gate_passed")
-        except HubError:
-            if apply_record is not None and apply_record.get("status") == "applied":
-                self._restore_apply(root, apply_record)
-                apply_record["status"] = "rolled_back"
+            if self.settings.automation.finalize.auto_commit:
+                status = git(
+                    root,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ).decode("utf-8", errors="replace")
+                changed_paths = {line[3:] for line in status.splitlines()}
+                if changed_paths != set(paths):
+                    raise HubError(
+                        "apply_failed",
+                        "Project changed during acceptance; automatic commit was refused",
+                        409,
+                    )
+                from app.git import commit_files
+
+                commit_files(root, paths, f"ReviewForge: apply {task_id}")
+                apply_record["after_head"] = head(root)
+                apply_record["auto_committed"] = True
                 (task_dir / "apply.json").write_text(
                     json.dumps(apply_record, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
                 self._refresh_result_archive(task_dir)
+            self._transition(task_id, "COMPLETED", stop_reason="gate_passed")
+        except HubError:
+            if apply_record is not None and apply_record.get("status") == "applied":
+                if head(root) == apply_record["before_head"]:
+                    self._restore_apply(root, apply_record)
+                    apply_record["status"] = "rolled_back"
+                    (task_dir / "apply.json").write_text(
+                        json.dumps(apply_record, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    self._refresh_result_archive(task_dir)
             raise
         except (OSError, UnicodeError) as exc:
             raise HubError(
@@ -710,6 +789,13 @@ class ReviewWorker:
                 "rollback_unavailable", "The latest finalization is already rolled back", 409
             )
         root = Path(project.root)
+        if record.get("auto_committed") or head(root) != record.get("after_head"):
+            raise HubError(
+                "rollback_conflict",
+                "Project history contains a commit after finalization; "
+                "automatic rollback would conflict with Git history",
+                409,
+            )
         for item in record["files"]:
             target = root / item["path"]
             current = target.read_bytes() if target.exists() else None
@@ -872,15 +958,22 @@ class ReviewWorker:
 
     def _prepare(self, task_id: str) -> None:
         task, project = self._load(task_id)
-        self._transition(
-            task_id, "BUILDING_CONTEXT", message="Checking project and creating worktree"
-        )
+        if task.status == "CREATED":
+            self._transition(
+                task_id, "BUILDING_CONTEXT", message="Checking project and creating worktree"
+            )
+        elif task.status != "BUILDING_CONTEXT":
+            raise HubError("invalid_state", "Task is not ready to run", 409)
         if self.settings.automation.require_clean_worktree:
             require_clean(project.root)
         if head(project.root) != task.base_commit:
             raise HubError("target_changed", "Project HEAD changed after task submission", 409)
-        Path(task.task_path).mkdir(parents=True, exist_ok=False)
-        create_worktree(project.root, Path(task.worktree_path), task.task_branch, task.base_commit)
+        task_path = Path(task.task_path)
+        worktree_path = Path(task.worktree_path)
+        if not task_path.exists():
+            task_path.mkdir(parents=True, exist_ok=False)
+        if not worktree_path.exists():
+            create_worktree(project.root, worktree_path, task.task_branch, task.base_commit)
 
     def _load(self, task_id: str) -> tuple[ReviewTask, ProjectConfig]:
         with self.session_factory() as session:

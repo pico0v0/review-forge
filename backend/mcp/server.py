@@ -191,15 +191,8 @@ def review_fix_instructions(task_id: str, severities: list[str] | None = None) -
 
 @mcp.tool()
 def review_retry(task_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Explain that retry needs the Hub retry API, which is not enabled yet."""
-    del task_id, overrides
-    return {
-        "ok": False,
-        "error": {
-            "code": "feature_not_available",
-            "message": "Retry with overrides is not enabled; submit a new review task",
-        },
-    }
+    """Retry a stopped review, optionally overriding models, limits, or dry_run."""
+    return _request("POST", f"/api/reviews/{task_id}/retry", json=overrides or {})
 
 
 if __name__ == "__main__":

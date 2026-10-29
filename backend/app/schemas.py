@@ -53,6 +53,15 @@ class ReviewSubmitRequest(BaseModel):
     dry_run: bool = True
 
 
+class ReviewRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer: ModelRoleSettings | None = None
+    fixer: ModelRoleSettings | None = None
+    limits: LimitSettings | None = None
+    dry_run: bool | None = None
+
+
 class ReviewTaskResponse(BaseModel):
     id: str
     project_id: str

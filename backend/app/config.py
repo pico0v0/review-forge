@@ -139,11 +139,18 @@ class GlobalLimitSettings(BaseModel):
     max_wall_time_min: int = Field(default=120, ge=1, le=7 * 24 * 60)
 
 
+class FinalizeAutomationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auto_commit: bool = False
+
+
 class AutomationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     require_clean_worktree: bool = True
     max_parallel_tasks: int = Field(default=1, ge=1, le=16)
+    finalize: FinalizeAutomationSettings = Field(default_factory=FinalizeAutomationSettings)
 
 
 class AppSettings(BaseSettings):

@@ -36,3 +36,5 @@ limits:
 automation:
   require_clean_worktree: true
   max_parallel_tasks: 1
+  finalize:
+    auto_commit: false

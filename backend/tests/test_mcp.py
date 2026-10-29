@@ -26,8 +26,16 @@ def test_mcp_exposes_review_tools() -> None:
     }
 
 
-def test_retry_explains_current_hub_boundary() -> None:
+def test_retry_uses_hub_retry_endpoint(monkeypatch) -> None:
     module = load_server()
-    result = module.review_retry("REV-20261028-001")
-    assert result["ok"] is False
-    assert result["error"]["code"] == "feature_not_available"
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        captured.update(method=method, path=path, kwargs=kwargs)
+        return {"ok": True, "data": {"status": "BUILDING_CONTEXT"}}
+
+    monkeypatch.setattr(module, "_request", fake_request)
+    result = module.review_retry("REV-20261028-001", {"dry_run": True})
+    assert result["ok"] is True
+    assert captured["method"] == "POST"
+    assert captured["path"].endswith("/retry")
